@@ -4,6 +4,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 
 #define MAX_ARGS 64
 #define MAX_CMDS 16
@@ -158,6 +159,63 @@ int splitArgs(char *segment, char *args[]){
    	return n;
 }
 
+//Remove "<", ">" and ">>" (and the file name after each) from args.
+//Fills inFile/outFile and sets append to 1 for ">>".
+//Returns -1 on syntax error
+int parseRedirections(char *args[], int *n, char **inFile, char **outFile, int *append){
+	int j = 0; //writing index
+	*inFile = NULL;
+	*outFile = NULL;
+	*append = 0;
+
+	for(int i = 0; i < *n; i++){
+		if (strcmp(args[i], "<") == 0 || strcmp(args[i], ">") == 0 || strcmp(args[i], ">>") == 0){
+			if (i + 1 >= *n){ //checks if the word at i+1 is the last word
+				fprintf(stderr, "ocsh: Syntax error: Missing file name after '%s'\n", args[i]);
+				return -1;
+			}
+			if (args[i][0] == '<'){ //if the second "word" is "<", we keep args[i+1] in inFile
+				*inFile = args[i+1];
+			}
+			else { //else, we keep it in outFile
+				*outFile = args[i+1];
+				*append = (args[i][1] == '>'); //true : ">>" -> append, false : ">"
+			}
+			i++;
+		}
+		else {
+			args[j++] = args[i]; //copy the arg at index j then increment j
+		}
+	}
+	args[j] = NULL;
+	*n = j;
+	return 0;
+}
+
+//
+int applyRedirections(const char *inFile, const char *outFile, int append){
+	if(inFile){
+		int fd = open(inFile, O_RDONLY);
+		if (fd < 0) {
+			perror(inFile);
+			return -1;
+		}
+		dup2(fd, STDIN_FILENO); //fd 0 now points to the file
+		close(fd); //the extra descriptor is no longer needed
+	}
+	if(outFile){
+		int flags = O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC);
+		int fd = open(outFile, flags, 0644);
+		if (fd < 0) {
+			perror(inFile);
+			return -1;
+		}
+		dup2(fd, STDOUT_FILENO); //fd 1 now points to the file
+		close(fd);
+	}
+	return 0;
+}
+
 int main(void){
     //Command Buffer
     char cmd[1024];
@@ -189,15 +247,31 @@ int main(void){
 	
 		for(int i = 0; i < nseg; i++){
 			char* args[MAX_ARGS];
+			char *inFile, *outFile;
 			int n = splitArgs(segments[i], args);
+			int append;
+			if(parseRedirections(args, &n, &inFile, &outFile, &append) < 0) continue;
 			if (n == 0) continue;
 
-			if(runBuiltins(args, n)) continue;
+			if (getBuiltin(args[0]) != B_NONE){
+				int savedIn = dup(STDIN_FILENO);
+				int savedOut = dup(STDOUT_FILENO);
+				if (applyRedirections(inFile, outFile, append) == 0)
+					runBuiltins(args, n);
+				dup2(savedIn, STDIN_FILENO);
+				dup2(savedOut, STDOUT_FILENO);
+				close(savedIn);
+				close(savedOut);
+				continue;
+			}
+				
 			resolveAlias(args);
 			
 			pid_t pid = fork();
 				if(pid == 0){
 					//Child process
+					if(applyRedirections(inFile, outFile, append) < 0)
+						exit(1);
 					execvp(args[0], args);
 						
 					//only if execvp fails
