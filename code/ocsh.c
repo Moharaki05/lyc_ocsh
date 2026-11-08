@@ -1,11 +1,13 @@
 /* The main source code of OCSH mini-shell */
 #include <stdio.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
 
+#define MAX_BUFFER 1024
 #define MAX_ARGS 64
 #define MAX_CMDS 16
 #define MAX_HISTORY 100
@@ -192,7 +194,7 @@ int parseRedirections(char *args[], int *n, char **inFile, char **outFile, int *
 	return 0;
 }
 
-//
+//Redirect stdin/stdout to the given files. Returns -1 if a file can't be opened
 int applyRedirections(const char *inFile, const char *outFile, int append){
 	if(inFile){
 		int fd = open(inFile, O_RDONLY);
@@ -218,17 +220,21 @@ int applyRedirections(const char *inFile, const char *outFile, int append){
 
 int main(void){
     //Command Buffer
-    char cmd[1024];
-    // Flush after every printf
-    setbuf(stdout, NULL);
+    char cmd[MAX_BUFFER];
+    //Flush after every printf
+    fflush(stdout);
 
-    // Main REPL
-    while (1) {
+	//Move cursor to top-left, then clear the screen
+    fprintf(stdout,"\033[H\033[2J");
+
+    //Main REPL
+    while (true) {
         fprintf(stdout, "ocsh> ");
 
         //Read the user's inputs
         if(fgets(cmd, sizeof(cmd), stdin) == NULL){
-        	fprintf(stdout, "\n");
+        	//fprintf(stdout, "\n");
+        	puts("");
         	break;	
         }
         
