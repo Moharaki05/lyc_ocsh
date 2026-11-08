@@ -286,7 +286,7 @@ int main(void){
 				}
 				else if (pid > 0){
 					//Parent process
-					waitpid(pid, NULL, 0);
+					wait(NULL);
 				}
 				else {
 					perror("fork");
