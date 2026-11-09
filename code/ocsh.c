@@ -83,7 +83,7 @@ int runBuiltins(char *args[], int n){
 	switch(getBuiltin(args[0])){
 		case B_GO: {
 			const char *dir = (n > 1) ? args[1] : getenv("HOME"); //goes to the wanted directory if given, goes to home otherwise
-			if (dir==NULL || chdir(dir) != 0)
+			if (dir == NULL || chdir(dir) != 0)
 				perror("go");
 			return 1;
 		}
@@ -127,9 +127,11 @@ int runBuiltins(char *args[], int n){
 			for (int i = 0; i < histCount; i++)
 				fprintf(stdout, "%4d	%s\n", i + 1, history[i]);
 			return 1;
+			
 		case B_OSINFO:
 			fprintf(stdout,"Systèmes d'exploitation -- UIR/ESIN\n");
 			return 1;	
+			
 		default:
 			return 0; //not a builtin
 	}
@@ -209,7 +211,7 @@ int applyRedirections(const char *inFile, const char *outFile, int append){
 		int flags = O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC);
 		int fd = open(outFile, flags, 0644);
 		if (fd < 0) {
-			perror(inFile);
+			perror(outFile);
 			return -1;
 		}
 		dup2(fd, STDOUT_FILENO); //fd 1 now points to the file
@@ -218,11 +220,88 @@ int applyRedirections(const char *inFile, const char *outFile, int append){
 	return 0;
 }
 
+void runPipelines(char *segments[], int nseg){
+	char *argv[MAX_CMDS][MAX_ARGS];
+	int argc_[MAX_CMDS];
+	char *inFile[MAX_CMDS], *outFile[MAX_CMDS];
+	int append[MAX_CMDS];
+
+	//Parses every segment first; abort the whole pipeline on error
+	for (int i = 0; i < nseg; i++) {
+		argc_[i] = splitArgs(segments[i], argv[i]);
+		if (parseRedirections(argv[i], &argc_[i], &inFile[i], &outFile[i], &append[i]) < 0) return;
+		if (argc_[i] == 0){
+			fprintf(stderr, "osch : Syntax error: empty command near '->'\n");
+			return;
+		}
+	}
+
+	//Creates the pipes and one child per command
+	pid_t pids[MAX_CMDS];
+	int started = 0;
+	int prevRead = -1; //red end of previous pipe (-1 for the first command)
+
+	for (int i = 0; i < nseg; i++) {
+		int fd[2] = {-1, -1}; // stays -1 for the last command (no pipe after it)
+		if (i < nseg - 1 && pipe(fd) < 0) {
+			perror("pipe");
+			break;
+		}
+
+		pid_t pid = fork();
+		if (pid < 0){
+			if (fd[0] != -1) {
+				close(fd[0]);
+				close(fd[1]);
+			}
+			break;
+		}
+
+		if (pid == 0) {
+			//Child process : plug stdin on previous pipe, stdout on the next one.
+			if (prevRead != -1){
+				dup2(prevRead, STDIN_FILENO);
+				close(prevRead);
+			}
+			if (fd[1] != -1){
+				dup2(fd[1], STDOUT_FILENO);
+				close(fd[0]);
+				close(fd[1]);
+			}
+
+			//Explicit redirections override the pipe
+			if (applyRedirections(inFile[i], outFile[i], append[i] < 0))
+				exit(EXIT_FAILURE);
+
+			//A builtin inside a pipe runs in the child
+			if (runBuiltins(argv[i], argc_[i]))
+				exit(EXIT_SUCCESS);
+
+			resolveAlias(argv[i]);
+			execvp(argv[i][0], argv[i]);
+			fprintf(stderr, "%s: Command not found.\n", argv[i][0]);
+			exit(127);
+		}
+
+		//Parent process : remember the child, close the ends it doesn't need anymore
+		pids[started++] = pid;
+		if (prevRead != -1) close(prevRead);
+		if (fd[1] != -1) close(fd[1]);
+		prevRead = fd[0]; //becomes the stdin source of the next child
+	}
+	
+	if (prevRead != -1) close(prevRead); // only reached after a break;
+
+	//Wait for all children, only after all of them are started
+	for(int k = 0; k < started; k++)
+		waitpid(pids[k], NULL, 0);
+}
+
 int main(void){
     //Command Buffer
     char cmd[MAX_BUFFER];
     //Flush after every printf
-    fflush(stdout);
+    setbuf(stdout, NULL);
 
 	//Move cursor to top-left, then clear the screen
     fprintf(stdout,"\033[H\033[2J");
@@ -250,48 +329,50 @@ int main(void){
 		
         char* segments[MAX_CMDS];
         int nseg = splitPipeline(cmd, segments);
-	
-		for(int i = 0; i < nseg; i++){
+
+		if (nseg == 1) {
 			char* args[MAX_ARGS];
 			char *inFile, *outFile;
-			int n = splitArgs(segments[i], args);
+			int n = splitArgs(segments[0], args);
 			int append;
 			if(parseRedirections(args, &n, &inFile, &outFile, &append) < 0) continue;
 			if (n == 0) continue;
-
+			
 			if (getBuiltin(args[0]) != B_NONE){
 				int savedIn = dup(STDIN_FILENO);
 				int savedOut = dup(STDOUT_FILENO);
 				if (applyRedirections(inFile, outFile, append) == 0)
-					runBuiltins(args, n);
-				dup2(savedIn, STDIN_FILENO);
-				dup2(savedOut, STDOUT_FILENO);
-				close(savedIn);
-				close(savedOut);
-				continue;
-			}
-				
-			resolveAlias(args);
-			
-			pid_t pid = fork();
-				if(pid == 0){
-					//Child process
-					if(applyRedirections(inFile, outFile, append) < 0)
-						exit(1);
-					execvp(args[0], args);
+						runBuiltins(args, n);
+					dup2(savedIn, STDIN_FILENO);
+					dup2(savedOut, STDOUT_FILENO);
+					close(savedIn);
+					close(savedOut);
+					continue;
+				}
+							
+				resolveAlias(args);
 						
-					//only if execvp fails
-					fprintf(stderr, "%s: Command not found.\n", args[0]); 
-					exit(127); //127 is the default error code for command not found		
-				}
-				else if (pid > 0){
-					//Parent process
-					wait(NULL);
-				}
-				else {
-					perror("fork");
-				}
+				pid_t pid = fork();
+					if(pid == 0){
+						//Child process
+						if(applyRedirections(inFile, outFile, append) < 0)
+							exit(1);
+						execvp(args[0], args);
+									
+						//only if execvp fails
+						fprintf(stderr, "%s: Command not found.\n", args[0]); 
+						exit(127); //127 is the default error code for command not found		
+					}
+					else if (pid > 0){
+						//Parent process
+						wait(NULL);
+					}
+					else {
+						perror("fork");
+					}
 		}
+		else {
+			runPipelines(segments, nseg);
+		}        
     }
-	return 0;
 }
