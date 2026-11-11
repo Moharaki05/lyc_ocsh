@@ -6,15 +6,145 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <ctype.h>
+
+extern char **environ;
 
 #define MAX_BUFFER 1024
 #define MAX_ARGS 64
 #define MAX_CMDS 16
 #define MAX_HISTORY 100
+#define MAX_VARS 64
+#define MAX_NAME 64
+#define MAX_VALUE 256
 
 // Command history
 char *history[MAX_HISTORY];
 int histCount = 0;
+
+// Shell vars ($VAR, ${VAR})
+struct Var {
+	char name[MAX_NAME];
+	char value[MAX_VALUE];
+};
+
+struct Var vars[MAX_VARS];
+int varCount = 0;
+
+int lastStatus = 0;	// $? : exit status of last foreground command
+pid_t lastBgPid = 0;	// $! : PID of the last bg job (set by the "&" code)
+
+// Checks if the name is valid : letters, digits, '_' and not starting with a digit
+int isValidName(const char *s, size_t length) {
+	if (length == 0 || !(isalpha((unsigned char)s[0]) || s[0] == '_'))
+		return 0;
+	for (size_t i = 1; i < length; i++){
+		if (!(isalnum((unsigned char)s[i]) || s[i] == '_'))
+			return 0;
+	}
+	return 1;
+}
+
+// Checks if the word is of the form NAME=value
+int isAssignment(const char *word) {
+	const char *eq = strchr(word, '=');
+	return eq != NULL && isValidName(word, (size_t)(eq - word));	
+}
+
+// Shell table first, then the env (HOME, PATH, USER...).
+// Returns NULL if unset.
+const char *getVar(const char *name){
+	for (int i = 0; i < varCount; i++)
+		if(strcmp(vars[i].name, name) == 0) return vars[i].value;
+	return getenv(name);
+}
+
+int setVar (const char *name, const char *value){
+	int index = -1;
+	for (int i = 0; i < varCount; i++)
+		if(strcmp(vars[i].name, name) == 0){
+			index = i;
+			break;
+		}
+	if (index < 0) {
+		if (varCount >= MAX_VARS) {
+			fprintf(stderr, "ocsh: too many variables\n");
+			return -1;
+		}
+		index = varCount++;
+		snprintf(vars[index].name, MAX_NAME, "%s", name);
+	}
+	snprintf(vars[index].value, MAX_VALUE, "%s", value);
+	if(getenv(name) != NULL) //Checks if env var already got exported
+		setenv(name, value, 1);
+	return 0;
+}
+
+// Exit status from waitpid : normal exit code, or 128 + signal number.
+int statusToCode(int status){
+	// WIFEXITED checks if a child process has been terminated correctly
+	// WIFSIGNALED checks if a child process has been terminated because of a signal
+	// WTERMSIG returns the interrupting signal's number
+	if (WIFEXITED(status)) return WEXITSTATUS(status);
+	if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+
+	return 1;
+}
+
+void expandVars(const char *in, char *out, size_t size){
+	size_t o = 0, i = 0;
+	while (in[i] != '\0' && o < size - 1){
+		if (in[i] != '$'){
+			out[o++] = in[i++];
+			continue;
+		}
+		i++;	// skip the '$'
+		char name[MAX_NAME];
+		char num[32];
+		const char *val = NULL;
+
+		if (in[i] == '?'){
+			snprintf(num, sizeof(num), "%d", lastStatus);
+			val = num;
+			i++;
+		}
+		else if (in[i] == '!'){
+			if (lastBgPid > 0)
+				snprintf(num, sizeof(num), "%d", (int)lastBgPid);
+			else num[0] = '\0'; // no BG job yet : empty
+			val = num;
+			i++;
+		}
+		else if (in[i] == '{'){
+			const char *end = strchr(in + i, '}');
+			size_t length = end ? (size_t)(end - (in + i + 1)) : 0;
+			if (end == NULL || length >= MAX_NAME || !isValidName(in + i + 1, length)) {
+				out[o++] = '$'; // not a valid ${NAME}: keep it as a text
+				continue;
+			}
+			//memcpy copies memory blocks from a mem address to a specified one.
+			memcpy(name, in + i + 1, length);
+			name[length] = '\0';
+			val = getVar(name);
+			i = (size_t)(end - in) + 1;
+		}
+		else if (isalpha((unsigned char)in[i]) || in[i] == '_') {
+			size_t length = 0;
+			while ((isalnum((unsigned char)in[i]) || in[i] == '_') && length < MAX_NAME - 1)
+				name[length++] = in[i++];
+			name[length] = '\0';
+			val = getVar(name);
+		}
+		else {
+			out[o++] = '$'; // lone '$': keep it as text
+			continue;
+		}
+
+		for (size_t k = 0; val && val[k] != '\0' && o < size - 1; k++)
+			out[o++] = val[k];
+	}
+	out[o] = '\0';
+}
 
 // Alias table: ocsh names -> real Linux commands
 struct Alias {
@@ -50,7 +180,10 @@ enum Builtin {
 	B_SAY,
 	B_INFO,
 	B_PAST,
-	B_OSINFO
+	B_OSINFO,
+	B_SHOWENV,
+	B_ASSIGN,
+	B_EXPORT
 };
 
 enum Builtin getBuiltin(const char *name){
@@ -61,6 +194,9 @@ enum Builtin getBuiltin(const char *name){
 	if(strcmp(name, "info") == 0) return B_INFO;
 	if(strcmp(name, "past") == 0) return B_PAST;
 	if(strcmp(name, "osinfo") == 0) return B_OSINFO;
+	if(strcmp(name, "showenv") == 0) return B_SHOWENV;
+	if(isAssignment(name)) return B_ASSIGN;
+	if(strcmp(name, "export") == 0) return B_EXPORT;
 	return B_NONE;
 }
 
@@ -74,8 +210,10 @@ struct Info infoTable[] = {
 	{"path", "path	print the current directory"},
 	{"say", "say [text]	print text"},
 	{"info", "info [cmd]	show help about a builtin"},
-	{"past", "past	show the command history)"},
+	{"past", "past	show the command history"},
 	{"osinfo", "osinfo	show course information"},
+	{"showenv",	"showenv	show environment variables"},
+	{"export",	"export NAME[=value]	make a variable visible to the programs you launch"}
 };
 int infoCount = sizeof(infoTable) / sizeof(infoTable[0]);
 
@@ -83,8 +221,10 @@ int runBuiltins(char *args[], int n){
 	switch(getBuiltin(args[0])){
 		case B_GO: {
 			const char *dir = (n > 1) ? args[1] : getenv("HOME"); //goes to the wanted directory if given, goes to home otherwise
-			if (dir == NULL || chdir(dir) != 0)
+			if (dir == NULL || chdir(dir) != 0){
 				perror("go");
+				lastStatus = 1;
+			}
 			return 1;
 		}
 		case B_QUIT: 
@@ -94,8 +234,10 @@ int runBuiltins(char *args[], int n){
 			char buf[1024];
 			if(getcwd(buf, sizeof(buf)) != NULL) //check if the current working dir exists
 				fprintf(stdout, "%s\n", buf);
-			else
+			else{
 				perror("path");
+				lastStatus = 1;
+			}
 			return 1;
 		}
 		case B_SAY: 
@@ -120,6 +262,7 @@ int runBuiltins(char *args[], int n){
 					}
 				}
 				fprintf(stderr, "info: no help for '%s'\n", args[1]);
+				lastStatus = 1;
 			}
 			return 1;
 		
@@ -129,8 +272,47 @@ int runBuiltins(char *args[], int n){
 			return 1;
 			
 		case B_OSINFO:
-			fprintf(stdout,"Systèmes d'exploitation -- UIR/ESIN\n");
-			return 1;	
+			fprintf(stdout,"Systèmes d'Exploitation -- UIR/ESIN\n");
+			return 1;
+
+		case B_SHOWENV: {
+			fprintf(stdout, "* ENV:\n");
+			for(char **e = environ; *e != NULL; e++){
+				fprintf(stdout, "%s\n", *e);
+			}
+			return 1;
+		}
+
+		case B_ASSIGN: {
+			char *eq = strchr(args[0], '=');
+			*eq = '\0'; // split "NAME=value" into "NAME" and "value"
+			if (setVar(args[0], eq + 1) < 0) lastStatus = 1;
+			return 1;
+		}
+
+		case B_EXPORT: {
+			if (n == 1){
+				for (int i = 0; i < varCount; i++)
+					fprintf(stdout, "%s=%s\n", vars[i].name, vars[i].value);
+				return 1;
+			}
+			for (int i = 1; i < n; i++){
+				char *eq = strchr(args[i], '=');
+				size_t length = eq ? (size_t)(eq - args[i]) : strlen(args[i]);
+				if (!isValidName(args[i], length)){
+					fprintf(stderr, "export: '%s': not a valid identifier\n", args[i]);
+					lastStatus = 1;
+					continue;
+				}
+				if (eq) {
+					*eq = '\0';
+					setVar(args[i], eq + 1);
+				}
+				const char *val = getVar(args[i]);
+				setenv(args[i], val ? val : "", 1);
+			}
+			return 1;
+		}
 			
 		default:
 			return 0; //not a builtin
@@ -270,12 +452,14 @@ void runPipelines(char *segments[], int nseg){
 			}
 
 			//Explicit redirections override the pipe
-			if (applyRedirections(inFile[i], outFile[i], append[i] < 0))
+			if (applyRedirections(inFile[i], outFile[i], append[i]) < 0)
 				exit(EXIT_FAILURE);
 
+			lastStatus = 0;
+			
 			//A builtin inside a pipe runs in the child
 			if (runBuiltins(argv[i], argc_[i]))
-				exit(EXIT_SUCCESS);
+				exit(lastStatus);
 
 			resolveAlias(argv[i]);
 			execvp(argv[i][0], argv[i]);
@@ -293,8 +477,12 @@ void runPipelines(char *segments[], int nseg){
 	if (prevRead != -1) close(prevRead); // only reached after a break;
 
 	//Wait for all children, only after all of them are started
-	for(int k = 0; k < started; k++)
-		waitpid(pids[k], NULL, 0);
+	for(int k = 0; k < started; k++){
+		int status = 0;
+		waitpid(pids[k], &status, 0);
+		if (k == nseg - 1) lastStatus = statusToCode(status);
+	}
+	if (started < nseg) lastStatus = 1;
 }
 
 int main(void){
@@ -326,9 +514,12 @@ int main(void){
 
         if(histCount < MAX_HISTORY)
         	history[histCount++] = strdup(cmd);
+
+        char expanded[MAX_BUFFER];
+        expandVars(cmd, expanded, sizeof(expanded));
 		
         char* segments[MAX_CMDS];
-        int nseg = splitPipeline(cmd, segments);
+        int nseg = splitPipeline(expanded, segments);
 
 		if (nseg == 1) {
 			char* args[MAX_ARGS];
@@ -341,35 +532,40 @@ int main(void){
 			if (getBuiltin(args[0]) != B_NONE){
 				int savedIn = dup(STDIN_FILENO);
 				int savedOut = dup(STDOUT_FILENO);
+				lastStatus = 0;
 				if (applyRedirections(inFile, outFile, append) == 0)
-						runBuiltins(args, n);
-					dup2(savedIn, STDIN_FILENO);
-					dup2(savedOut, STDOUT_FILENO);
-					close(savedIn);
-					close(savedOut);
-					continue;
-				}
+					runBuiltins(args, n);
+				else
+					lastStatus = 1;
+				dup2(savedIn, STDIN_FILENO);
+				dup2(savedOut, STDOUT_FILENO);
+				close(savedIn);
+				close(savedOut);
+				continue;
+			}
 							
-				resolveAlias(args);
+			resolveAlias(args);
 						
-				pid_t pid = fork();
-					if(pid == 0){
-						//Child process
-						if(applyRedirections(inFile, outFile, append) < 0)
-							exit(1);
-						execvp(args[0], args);
+			pid_t pid = fork();
+				if(pid == 0){
+					//Child process
+					if(applyRedirections(inFile, outFile, append) < 0)
+						exit(1);
+					execvp(args[0], args);
 									
-						//only if execvp fails
-						fprintf(stderr, "%s: Command not found.\n", args[0]); 
-						exit(127); //127 is the default error code for command not found		
-					}
-					else if (pid > 0){
-						//Parent process
-						wait(NULL);
-					}
-					else {
-						perror("fork");
-					}
+					//only if execvp fails
+					fprintf(stderr, "%s: Command not found.\n", args[0]); 
+					exit(127); //127 is the default error code for command not found		
+				}
+				else if (pid > 0){
+					//Parent process
+					int status = 0;
+					if(wait(&status) > 0)
+						lastStatus = statusToCode(status);
+				}
+				else {
+					perror("fork");
+				}
 		}
 		else {
 			runPipelines(segments, nseg);
